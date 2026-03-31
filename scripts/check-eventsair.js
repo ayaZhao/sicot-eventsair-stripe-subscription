@@ -1,7 +1,7 @@
 import 'dotenv/config';
 import { lookupMembershipContactsByEmail } from '../src/eventsair-api.js';
 
-const email = process.argv[2] || process.env.LOCAL_MEMBER_EMAIL;
+const email = process.argv[2];
 
 if (!email) {
   console.error('Usage: npm run check:eventsair -- user@example.com');

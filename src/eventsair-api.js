@@ -1,31 +1,9 @@
 import 'dotenv/config';
 import fetch from 'node-fetch';
+import { isPrimaryMembershipType } from './registration-type-map.js';
 
 const defaultGraphqlUrl = 'https://api.eventsair.com/graphql';
 const defaultTokenScope = 'https://eventsairprod.onmicrosoft.com/85d8f626-4e3d-4357-89c6-327d4e6d3d93/.default';
-const eventRegistrationTypesQuery = `
-  query ListEventRegistrationTypes($eventId: ID!) {
-    event(id: $eventId) {
-      id
-      name
-      setup {
-        registration {
-          registrationTypes(offset: 0, limit: 200) {
-            id
-            name
-            uniqueCode
-            fees {
-              amount
-              currency {
-                code
-              }
-            }
-          }
-        }
-      }
-    }
-  }
-`;
 const eventContactLookupQuery = `
   query LookupEventContactsByEmail($eventId: ID!, $email: String!) {
     event(id: $eventId) {
@@ -69,25 +47,8 @@ function normalizeTypeName(typeName) {
   return typeof typeName === 'string' ? typeName.trim().toLowerCase() : null;
 }
 
-function getPrimaryMembershipTypeNames() {
-  const configuredNames = process.env.EVENTSAIR_PRIMARY_MEMBERSHIP_TYPES;
-  if (!configuredNames) {
-    return ['active member', 'associate membership'];
-  }
-
-  return configuredNames
-    .split(',')
-    .map((value) => normalizeTypeName(value))
-    .filter(Boolean);
-}
-
 function isPrimaryMembershipTypeName(typeName) {
-  const normalizedTypeName = normalizeTypeName(typeName);
-  if (!normalizedTypeName) {
-    return false;
-  }
-
-  return getPrimaryMembershipTypeNames().includes(normalizedTypeName);
+  return Boolean(typeName) && isPrimaryMembershipType(typeName);
 }
 
 export function classifyRegistrations(registrations) {
@@ -447,54 +408,5 @@ export async function lookupMembershipContactsByEmailAcrossEvents(email) {
     matches,
     scanned_events: scannedEvents,
     errors,
-  };
-}
-
-export async function fetchEventRegistrationTypes(eventId = null) {
-  const resolvedEventId = eventId || getRequiredEnv('EVENTSAIR_CONTACT_LOOKUP_EVENT_ID');
-  const eventPayload = await runEventsAirGraphqlQuery({
-    query: eventRegistrationTypesQuery,
-    variables: {
-      eventId: resolvedEventId,
-    },
-  });
-
-  if (eventPayload.errors && eventPayload.errors.length > 0) {
-    return {
-      found: false,
-      event_id: resolvedEventId,
-      errors: eventPayload.errors,
-      raw_payload: eventPayload,
-      registration_types: [],
-    };
-  }
-
-  const eventRecord = eventPayload.data && eventPayload.data.event
-    ? eventPayload.data.event
-    : null;
-  const registrationTypes = eventRecord
-    && eventRecord.setup
-    && eventRecord.setup.registration
-    && Array.isArray(eventRecord.setup.registration.registrationTypes)
-    ? eventRecord.setup.registration.registrationTypes
-    : [];
-
-  return {
-    found: Boolean(eventRecord),
-    event_id: eventRecord ? eventRecord.id : resolvedEventId,
-    event_name: eventRecord ? eventRecord.name : null,
-    total_registration_types: registrationTypes.length,
-    registration_types: registrationTypes.map((registrationType) => ({
-      id: registrationType.id,
-      name: registrationType.name,
-      unique_code: registrationType.uniqueCode || null,
-      fees: Array.isArray(registrationType.fees)
-        ? registrationType.fees.map((fee) => ({
-            amount: fee.amount,
-            currency_code: fee.currency ? fee.currency.code : null,
-          }))
-        : [],
-    })),
-    raw_payload: eventPayload,
   };
 }

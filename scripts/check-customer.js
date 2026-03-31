@@ -1,13 +1,12 @@
 import 'dotenv/config';
 import Stripe from 'stripe';
-import { lookupMembershipContactsByEmail } from '../src/eventsair-api.js';
+import { lookupMembershipContactsByEmailAcrossEvents } from '../src/eventsair-api.js';
 import {
   buildSubscriptionItemsFromRegistrationTypes,
-  stripeCatalogConfig,
 } from '../src/registration-type-map.js';
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
-const email = process.argv[2] || process.env.LOCAL_MEMBER_EMAIL;
+const email = process.argv[2];
 const defaultTaxRateId = process.env.STRIPE_DEFAULT_TAX_RATE_ID || null;
 const createSubscriptions = process.env.CREATE_SUBSCRIPTIONS === 'true';
 const checkoutArtifactWindowSeconds = 30 * 60;
@@ -207,7 +206,7 @@ async function main() {
 
   let eventsAirLookup = null;
   try {
-    eventsAirLookup = await lookupMembershipContactsByEmail(email);
+    eventsAirLookup = await lookupMembershipContactsByEmailAcrossEvents(email);
   } catch (error) {
     eventsAirLookup = {
       found: false,
@@ -354,20 +353,21 @@ async function main() {
     },
     customer_metadata_preview: preparedCustomerMetadata,
     subscription_metadata_preview: preparedSubscriptionMetadata,
-    stripe_catalog_mapping: {
-      mode: stripeCatalogConfig.mode || 'unknown',
-      primary_membership_types: stripeCatalogConfig.primaryMembershipTypes,
-      aliases: stripeCatalogConfig.aliases,
-    },
     eventsair_lookup: {
       email,
       found: Boolean(selectedEventsAirMatch),
-      event_id: eventsAirLookup && eventsAirLookup.event_id ? eventsAirLookup.event_id : null,
-      event_name: eventsAirLookup && eventsAirLookup.event_name ? eventsAirLookup.event_name : null,
+      event_id: selectedEventsAirMatch && selectedEventsAirMatch.event_id ? selectedEventsAirMatch.event_id : null,
+      event_name: selectedEventsAirMatch && selectedEventsAirMatch.event_name ? selectedEventsAirMatch.event_name : null,
       total_matches: eventsAirLookup && typeof eventsAirLookup.total_matches === 'number'
         ? eventsAirLookup.total_matches
         : 0,
+      total_events_scanned: eventsAirLookup && typeof eventsAirLookup.total_events_scanned === 'number'
+        ? eventsAirLookup.total_events_scanned
+        : null,
       selected_match: summarizeEventsAirMatch(selectedEventsAirMatch),
+      scanned_events: eventsAirLookup && Array.isArray(eventsAirLookup.scanned_events)
+        ? eventsAirLookup.scanned_events.filter((event) => event.match_count > 0)
+        : [],
       errors: eventsAirLookup && eventsAirLookup.errors ? eventsAirLookup.errors : null,
       error: eventsAirLookup && eventsAirLookup.error ? eventsAirLookup.error : null,
     },

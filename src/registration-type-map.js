@@ -118,26 +118,3 @@ export function buildSubscriptionItemsFromRegistrationTypes({ primaryMembershipT
     missing_price_mappings: missingPriceMappings,
   };
 }
-
-export function buildRegistrationTypeStripeTemplate(registrationTypes) {
-  const normalizedTypes = Array.isArray(registrationTypes) ? registrationTypes : [];
-
-  return normalizedTypes.reduce((result, registrationType) => {
-    const sourceName = registrationType && registrationType.name ? registrationType.name : null;
-    const resolvedName = resolveRegistrationTypeAlias(sourceName);
-    if (!resolvedName) {
-      return result;
-    }
-
-    result[resolvedName] = {
-      role: isPrimaryMembershipType(resolvedName) ? 'primary' : 'addon',
-      priceId: 'price_xxx',
-      eventsairRegistrationTypeId: registrationType.id || null,
-      eventsairRegistrationTypeName: sourceName,
-      eventsairUniqueCode: registrationType.unique_code || null,
-      eventsairFees: Array.isArray(registrationType.fees) ? registrationType.fees : [],
-    };
-
-    return result;
-  }, {});
-}
