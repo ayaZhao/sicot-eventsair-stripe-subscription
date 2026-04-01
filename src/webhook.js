@@ -10,6 +10,8 @@ const port = Number(process.env.PORT || 3000);
 const createSubscriptions = process.env.CREATE_SUBSCRIPTIONS === 'true';
 const defaultTaxRateId = process.env.STRIPE_DEFAULT_TAX_RATE_ID || null;
 const checkoutArtifactWindowSeconds = 30 * 60;
+const freeMembershipCaptureAmountCents = 100;
+const freeMembershipCaptureCurrency = 'eur';
 
 function toIso(unixSeconds) {
   return unixSeconds ? new Date(unixSeconds * 1000).toISOString() : null;
@@ -78,6 +80,21 @@ function summarizeInvoiceItem(invoiceItem) {
   };
 }
 
+function summarizeRefund(refund) {
+  if (!refund) {
+    return null;
+  }
+
+  return {
+    id: refund.id,
+    payment_intent: refund.payment_intent,
+    amount: refund.amount,
+    currency: refund.currency,
+    status: refund.status,
+    reason: refund.reason || null,
+  };
+}
+
 function buildStripeMetadata({ primaryMembershipType, addonMembershipTypes }) {
   return {
     source: 'eventsair',
@@ -115,6 +132,18 @@ function selectBestEventsAirMatch(eventsAirLookup) {
     : [];
 
   return matches.find((match) => match.primary_membership_type) || matches[0] || null;
+}
+
+function isFreeUserRefundCandidate({ primaryMembershipType, addonMembershipTypes, session }) {
+  // A free membership checkout is modeled as a temporary 1 EUR card-capture payment
+  // with a primary membership type and no addon registrations.
+  const hasPrimaryMembership = Boolean(primaryMembershipType);
+  const hasNoAddons = Array.isArray(addonMembershipTypes) && addonMembershipTypes.length === 0;
+  const isOneEuroCheckout = session
+    && session.amount_total === freeMembershipCaptureAmountCents
+    && String(session.currency || '').toLowerCase() === freeMembershipCaptureCurrency;
+
+  return hasPrimaryMembership && hasNoAddons && isOneEuroCheckout;
 }
 
 function isLikelyCheckoutArtifact(invoiceItem, session) {
@@ -233,6 +262,11 @@ app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (re
 
       const trialEnd = session.created + 365 * 24 * 60 * 60;
       const defaultPaymentMethod = paymentMethods.data[0] || null;
+      const isFreeUserFlow = isFreeUserRefundCandidate({
+        primaryMembershipType,
+        addonMembershipTypes,
+        session,
+      });
       const stripeMetadata = buildStripeMetadata({
         primaryMembershipType,
         addonMembershipTypes,
@@ -260,6 +294,11 @@ app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (re
           email,
           name: customer.name,
           metadata: customer.metadata,
+        },
+        checkout_payment: {
+          amount_total: session.amount_total,
+          currency: session.currency || null,
+          payment_intent: session.payment_intent || null,
         },
         eventsair_lookup: {
           email,
@@ -292,11 +331,49 @@ app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (re
         open_invoices: openInvoices.data.map(summarizeInvoice),
         planned_trial_end_unix: trialEnd,
         planned_trial_end_iso: toIso(trialEnd),
+        flow_type: isFreeUserFlow ? 'free-user-refund' : 'paid-membership',
+        free_user_evaluation: {
+          eligible_for_auto_refund: isFreeUserFlow,
+          requires_primary_membership_type: Boolean(primaryMembershipType),
+          requires_no_addons: addonMembershipTypes.length === 0,
+          requires_one_euro_checkout: session.amount_total === freeMembershipCaptureAmountCents
+            && String(session.currency || '').toLowerCase() === freeMembershipCaptureCurrency,
+        },
         mapped_subscription_items: subscriptionItemPreview.items,
         missing_price_mappings: subscriptionItemPreview.missing_price_mappings,
         default_tax_rate_id: defaultTaxRateId,
         create_subscriptions_enabled: createSubscriptions,
         subscription_create_params: subscriptionCreateParams,
+      };
+
+      let refundResult = null;
+      const refundFreeUserCapture = async () => {
+        if (!isFreeUserFlow || refundResult || !createSubscriptions) {
+          return refundResult;
+        }
+
+        if (!session.payment_intent) {
+          throw new Error('Free-user auto-refund is enabled, but checkout.session.completed did not include a payment_intent');
+        }
+
+        refundResult = await stripe.refunds.create(
+          {
+            payment_intent: session.payment_intent,
+            reason: 'requested_by_customer',
+            metadata: {
+              source: 'eventsair-free-membership',
+              checkout_session_id: session.id,
+              customer_id: customerId,
+              primary_membership_type: primaryMembershipType || '',
+            },
+          },
+          {
+            idempotencyKey: `eventsair-free-refund-${session.id}`,
+          },
+        );
+
+        debugResult.refund_result = summarizeRefund(refundResult);
+        return refundResult;
       };
 
       if (!selectedEventsAirMatch) {
@@ -309,6 +386,12 @@ app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (re
         debugResult.note = 'No primary membership type found in EventsAIR registrations. Subscription was not created.';
         console.log(JSON.stringify(debugResult, null, 2));
         return res.json({ received: true, skipped: 'missing-primary-membership-type' });
+      }
+
+      if (isFreeUserFlow) {
+        // Refund the temporary card-capture charge before continuing with
+        // subscription creation so free users are never left with a retained 1 EUR payment.
+        await refundFreeUserCapture();
       }
 
       if (subscriptionItemPreview.missing_price_mappings.length > 0) {
@@ -366,8 +449,9 @@ app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (re
 
       debugResult.cleanup_result = cleanupResult;
 
-      // Create a trialing subscription that starts billing on the next renewal date,
-      // after the current EventsAIR payment has already covered this membership period.
+      // Both paid users and free users receive the same future renewal subscription.
+      // Paid users keep the checkout payment, while free users have already had their
+      // temporary 1 EUR card-capture charge refunded before subscription creation.
       const createdSubscription = await stripe.subscriptions.create(
         subscriptionCreateParams,
         {
@@ -375,8 +459,11 @@ app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (re
         },
       );
 
-      debugResult.note = 'Subscription created successfully.';
+      debugResult.note = isFreeUserFlow
+        ? 'Subscription created successfully and the temporary 1 EUR free-user charge was refunded.'
+        : 'Subscription created successfully.';
       debugResult.created_subscription = summarizeSubscription(createdSubscription);
+      debugResult.refund_result = summarizeRefund(refundResult);
       console.log(JSON.stringify(debugResult, null, 2));
     }
 
