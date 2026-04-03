@@ -1,5 +1,7 @@
 import 'dotenv/config';
 import express from 'express';
+import fs from 'node:fs/promises';
+import path from 'node:path';
 import Stripe from 'stripe';
 import { lookupMembershipContactsByEmail } from './eventsair-api.js';
 import { buildSubscriptionItemsFromRegistrationTypes } from './registration-type-map.js';
@@ -7,14 +9,156 @@ import { buildSubscriptionItemsFromRegistrationTypes } from './registration-type
 const app = express();
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 const port = Number(process.env.PORT || 3000);
+const enableConsoleLogs = process.env.WEBHOOK_CONSOLE_LOGS !== 'false';
+
+// Feature and billing defaults for the EventsAir membership renewal flow.
 const createSubscriptions = process.env.CREATE_SUBSCRIPTIONS === 'true';
 const defaultTaxRateId = process.env.STRIPE_DEFAULT_TAX_RATE_ID || null;
 const checkoutArtifactWindowSeconds = 30 * 60;
+
+// Free members complete a small temporary checkout so Stripe saves a reusable card.
+// That checkout is refunded before the yearly subscription is created.
 const freeMembershipCaptureAmountCents = 50;
 const freeMembershipCaptureCurrency = 'eur';
 
+// EventsAir can lag briefly before registrations appear after checkout completes.
+// These values define how long the webhook waits and retries the email lookup.
+const eventsAirLookupInitialDelayMs = 5 * 1000;
+const eventsAirLookupRetryDelayMs = 10 * 1000;
+const eventsAirLookupMaxAttempts = 6;
+
+// Stripe can deliver the same webhook more than once, so we keep a small local
+// processing state file and a timeout to prevent duplicate refund/subscription work.
+const webhookEventLockTimeoutMs = 10 * 60 * 1000;
+const webhookEventStatePath = process.env.WEBHOOK_EVENT_STATE_PATH
+  || path.resolve(process.cwd(), '.runtime', 'processed-stripe-events.json');
+
+// Webhook events are written both to stdout and to a local JSON-lines log file so
+// test-mode runs can be reviewed before the same code is deployed to live.
+const webhookLogPath = process.env.WEBHOOK_LOG_PATH
+  || path.resolve(process.cwd(), 'logs', 'webhook.log');
+
 function toIso(unixSeconds) {
   return unixSeconds ? new Date(unixSeconds * 1000).toISOString() : null;
+}
+
+async function loadWebhookEventState() {
+  try {
+    const file = await fs.readFile(webhookEventStatePath, 'utf8');
+    return JSON.parse(file);
+  } catch (error) {
+    if (error.code === 'ENOENT') {
+      return {};
+    }
+
+    throw error;
+  }
+}
+
+async function saveWebhookEventState(state) {
+  await fs.mkdir(path.dirname(webhookEventStatePath), { recursive: true });
+  await fs.writeFile(webhookEventStatePath, JSON.stringify(state, null, 2));
+}
+
+async function appendWebhookLog(entry) {
+  const logEntry = {
+    logged_at_iso: new Date().toISOString(),
+    ...entry,
+  };
+
+  await fs.mkdir(path.dirname(webhookLogPath), { recursive: true });
+  await fs.appendFile(webhookLogPath, `${JSON.stringify(logEntry)}\n`);
+}
+
+async function logWebhookJson(payload) {
+  if (enableConsoleLogs) {
+    console.log(JSON.stringify(payload, null, 2));
+  }
+  await appendWebhookLog(payload);
+}
+
+async function logWebhookMessage(payload) {
+  if (enableConsoleLogs) {
+    console.log(payload.message);
+  }
+  await appendWebhookLog(payload);
+}
+
+async function logWebhookError(payload) {
+  console.error(payload.message);
+  await appendWebhookLog(payload);
+}
+
+async function beginWebhookEventProcessing(eventId) {
+  // Mark the Stripe event as processing unless we have already completed it or
+  // another request is still actively handling the same event id.
+  const state = await loadWebhookEventState();
+  const existing = state[eventId];
+  const now = Date.now();
+
+  if (existing && existing.status === 'completed') {
+    return {
+      should_process: false,
+      reason: 'already-completed',
+      entry: existing,
+    };
+  }
+
+  if (
+    existing
+    && existing.status === 'processing'
+    && typeof existing.started_at_unix_ms === 'number'
+    && (now - existing.started_at_unix_ms) < webhookEventLockTimeoutMs
+  ) {
+    return {
+      should_process: false,
+      reason: 'already-processing',
+      entry: existing,
+    };
+  }
+
+  state[eventId] = {
+    status: 'processing',
+    started_at_unix_ms: now,
+    started_at_iso: new Date(now).toISOString(),
+  };
+  await saveWebhookEventState(state);
+
+  return {
+    should_process: true,
+    reason: 'started',
+    entry: state[eventId],
+  };
+}
+
+async function completeWebhookEventProcessing(eventId) {
+  const state = await loadWebhookEventState();
+  const existing = state[eventId] || {};
+  const now = Date.now();
+
+  state[eventId] = {
+    ...existing,
+    status: 'completed',
+    completed_at_unix_ms: now,
+    completed_at_iso: new Date(now).toISOString(),
+  };
+  await saveWebhookEventState(state);
+}
+
+async function releaseWebhookEventProcessing(eventId, errorMessage) {
+  const state = await loadWebhookEventState();
+  if (!state[eventId]) {
+    return;
+  }
+
+  state[eventId] = {
+    ...state[eventId],
+    status: 'failed',
+    failed_at_unix_ms: Date.now(),
+    failed_at_iso: new Date().toISOString(),
+    last_error: errorMessage,
+  };
+  await saveWebhookEventState(state);
 }
 
 function summarizeSubscription(subscription) {
@@ -39,47 +183,6 @@ function summarizeSubscription(subscription) {
   };
 }
 
-function summarizePaymentMethod(paymentMethod) {
-  if (!paymentMethod) {
-    return null;
-  }
-
-  return {
-    id: paymentMethod.id,
-    type: paymentMethod.type,
-    brand: paymentMethod.card ? paymentMethod.card.brand : null,
-    last4: paymentMethod.card ? paymentMethod.card.last4 : null,
-    exp_month: paymentMethod.card ? paymentMethod.card.exp_month : null,
-    exp_year: paymentMethod.card ? paymentMethod.card.exp_year : null,
-  };
-}
-
-function summarizeInvoice(invoice) {
-  return {
-    id: invoice.id,
-    status: invoice.status,
-    billing_reason: invoice.billing_reason,
-    collection_method: invoice.collection_method,
-    total: invoice.total,
-    amount_due: invoice.amount_due,
-    amount_remaining: invoice.amount_remaining,
-    created: invoice.created,
-    created_iso: toIso(invoice.created),
-  };
-}
-
-function summarizeInvoiceItem(invoiceItem) {
-  return {
-    id: invoiceItem.id,
-    amount: invoiceItem.amount,
-    currency: invoiceItem.currency,
-    description: invoiceItem.description,
-    invoice: invoiceItem.invoice,
-    date: invoiceItem.date,
-    date_iso: toIso(invoiceItem.date),
-  };
-}
-
 function summarizeRefund(refund) {
   if (!refund) {
     return null;
@@ -95,9 +198,16 @@ function summarizeRefund(refund) {
   };
 }
 
-function buildStripeMetadata({ primaryMembershipType, addonMembershipTypes }) {
+function wait(milliseconds) {
+  return new Promise((resolve) => {
+    setTimeout(resolve, milliseconds);
+  });
+}
+
+function buildStripeMetadata({ memberId, primaryMembershipType, addonMembershipTypes }) {
   return {
     source: 'eventsair',
+    member_id: memberId != null ? String(memberId) : '',
     primary_membership_type: primaryMembershipType || '',
     addon_membership_types: JSON.stringify(Array.isArray(addonMembershipTypes) ? addonMembershipTypes : []),
   };
@@ -116,13 +226,15 @@ function summarizeEventsAirMatch(match) {
     external_identifier: match.contact ? match.contact.externalIdentifier : null,
     primary_membership_type: match.primary_membership_type || null,
     addon_membership_types: match.addon_membership_types || [],
-    registrations: (match.contact && Array.isArray(match.contact.registrations)
-      ? match.contact.registrations
-      : []).map((registration) => ({
-        id: registration.id,
-        type_id: registration.type ? registration.type.id : null,
-        type_name: registration.type ? registration.type.name : null,
-      })),
+  };
+}
+
+function summarizeMappedSubscriptionItem(item) {
+  return {
+    role: item.role,
+    type_name: item.type_name,
+    source_type_name: item.source_type_name,
+    price: item.price,
   };
 }
 
@@ -134,16 +246,92 @@ function selectBestEventsAirMatch(eventsAirLookup) {
   return matches.find((match) => match.primary_membership_type) || matches[0] || null;
 }
 
+function hasRegistrationsReady(eventsAirLookup) {
+  const selectedMatch = selectBestEventsAirMatch(eventsAirLookup);
+  const registrations = selectedMatch
+    && selectedMatch.contact
+    && Array.isArray(selectedMatch.contact.registrations)
+    ? selectedMatch.contact.registrations
+    : [];
+
+  return registrations.length > 0;
+}
+
+async function lookupMembershipContactsByEmailWithRetry(email) {
+  // The membership type is driven by EventsAir registrations, so we retry the
+  // email lookup briefly until registrations are available or the retry window ends.
+  const attempts = [];
+  let lookup = null;
+  let selectedMatch = null;
+  let totalWaitedMs = 0;
+
+  for (let attemptNumber = 1; attemptNumber <= eventsAirLookupMaxAttempts; attemptNumber += 1) {
+    const waitBeforeAttemptMs = attemptNumber === 1
+      ? eventsAirLookupInitialDelayMs
+      : eventsAirLookupRetryDelayMs;
+
+    await wait(waitBeforeAttemptMs);
+    totalWaitedMs += waitBeforeAttemptMs;
+
+    try {
+      lookup = await lookupMembershipContactsByEmail(email);
+      selectedMatch = selectBestEventsAirMatch(lookup);
+
+      const registrations = selectedMatch
+        && selectedMatch.contact
+        && Array.isArray(selectedMatch.contact.registrations)
+        ? selectedMatch.contact.registrations
+        : [];
+
+      attempts.push({
+        attempt_number: attemptNumber,
+        waited_ms_before_attempt: waitBeforeAttemptMs,
+        found: Boolean(selectedMatch),
+        total_matches: lookup && typeof lookup.total_matches === 'number' ? lookup.total_matches : 0,
+        primary_membership_type: selectedMatch ? selectedMatch.primary_membership_type || null : null,
+        registration_count: registrations.length,
+      });
+
+      if (hasRegistrationsReady(lookup)) {
+        return {
+          lookup,
+          selected_match: selectedMatch,
+          total_waited_ms: totalWaitedMs,
+          attempts,
+        };
+      }
+    } catch (error) {
+      attempts.push({
+        attempt_number: attemptNumber,
+        waited_ms_before_attempt: waitBeforeAttemptMs,
+        found: false,
+        total_matches: 0,
+        primary_membership_type: null,
+        registration_count: 0,
+        error: error.message,
+      });
+    }
+  }
+
+  return {
+    lookup,
+    selected_match: selectedMatch,
+    total_waited_ms: totalWaitedMs,
+    attempts,
+  };
+}
+
 function isFreeUserRefundCandidate({ primaryMembershipType, addonMembershipTypes, session }) {
-  // A free membership checkout is modeled as a temporary 0.50 EUR card-capture payment
-  // with a primary membership type and no addon registrations.
+  // Free-user auto-refund only applies when EventsAir says the user has a primary
+  // membership type, no addons, and the checkout total matches the fixed 0.50 EUR
+  // temporary card-capture amount.
   const hasPrimaryMembership = Boolean(primaryMembershipType);
   const hasNoAddons = Array.isArray(addonMembershipTypes) && addonMembershipTypes.length === 0;
-  const isOneCentCheckout = session
+  const isCaptureAmountMatch = session
     && session.amount_total === freeMembershipCaptureAmountCents
     && String(session.currency || '').toLowerCase() === freeMembershipCaptureCurrency;
 
-  return hasPrimaryMembership && hasNoAddons && isOneCentCheckout;
+  return hasPrimaryMembership && hasNoAddons && isCaptureAmountMatch;
 }
 
 function isLikelyCheckoutArtifact(invoiceItem, session) {
@@ -189,40 +377,72 @@ async function cleanupCheckoutBillingArtifacts({ customerId, session, pendingInv
   };
 }
 
-app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+app.post('/api/eventsair/v1/stripe/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
   let event;
 
   try {
+    // Verify the Stripe signature before touching the event payload.
     event = stripe.webhooks.constructEvent(
       req.body,
       req.headers['stripe-signature'],
       process.env.STRIPE_WEBHOOK_SECRET,
     );
   } catch (error) {
-    console.error('Webhook signature verification failed:', error.message);
+    await logWebhookError({
+      type: 'webhook-signature-error',
+      message: `Webhook signature verification failed: ${error.message}`,
+    });
     return res.status(400).send(`Webhook Error: ${error.message}`);
   }
 
   try {
+    // Skip duplicate deliveries of the same Stripe event as early as possible.
+    const eventProcessingState = await beginWebhookEventProcessing(event.id);
+    if (!eventProcessingState.should_process) {
+      await logWebhookJson({
+        event_type: event.type,
+        stripe_event_id: event.id,
+        note: `Webhook event skipped because it is ${eventProcessingState.reason}.`,
+      });
+      return res.json({ received: true, skipped: eventProcessingState.reason });
+    }
+
     if (event.type === 'checkout.session.completed') {
       const session = event.data.object;
       const customerId = session.customer;
       if (!customerId) {
-        console.log('No customer found on checkout session');
+        await logWebhookMessage({
+          type: 'webhook-skip',
+          event_type: event.type,
+          stripe_event_id: event.id,
+          message: 'No customer found on checkout session',
+        });
+        await completeWebhookEventProcessing(event.id);
         return res.json({ received: true, skipped: 'no-customer' });
       }
 
       const customer = await stripe.customers.retrieve(customerId);
       const email = customer.email;
-      const eventsAirLookup = await lookupMembershipContactsByEmail(email);
-      const selectedEventsAirMatch = selectBestEventsAirMatch(eventsAirLookup);
+      // EventsAir registrations can lag slightly behind checkout completion, so the
+      // member lookup retries for a short window before we decide what to do.
+      const lookupResolution = await lookupMembershipContactsByEmailWithRetry(email);
+      const eventsAirLookup = lookupResolution.lookup;
+      const selectedEventsAirMatch = lookupResolution.selected_match;
+      const eventsAirMemberId = selectedEventsAirMatch && selectedEventsAirMatch.contact
+        ? selectedEventsAirMatch.contact.internalNumber
+        : null;
       const primaryMembershipType = selectedEventsAirMatch ? selectedEventsAirMatch.primary_membership_type : null;
       const addonMembershipTypes = selectedEventsAirMatch ? selectedEventsAirMatch.addon_membership_types || [] : [];
+
+      // Registration types from EventsAir drive both the Stripe price mapping and the
+      // decision about whether this checkout is a paid renewal or a free member capture.
       const subscriptionItemPreview = buildSubscriptionItemsFromRegistrationTypes({
         primaryMembershipType,
         addonMembershipTypes,
       });
 
+      // Pull the current Stripe customer state up front so we can avoid duplicate
+      // subscriptions and remove leftover one-time checkout billing artifacts.
       const paymentMethods = await stripe.paymentMethods.list({
         customer: customerId,
         type: 'card',
@@ -262,12 +482,17 @@ app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (re
 
       const trialEnd = session.created + 365 * 24 * 60 * 60;
       const defaultPaymentMethod = paymentMethods.data[0] || null;
+
+      // Free members are modeled as a 0.50 EUR checkout with a primary membership type
+      // and no addons. If matched, that temporary capture is refunded before we create
+      // the yearly subscription.
       const isFreeUserFlow = isFreeUserRefundCandidate({
         primaryMembershipType,
         addonMembershipTypes,
         session,
       });
       const stripeMetadata = buildStripeMetadata({
+        memberId: eventsAirMemberId,
         primaryMembershipType,
         addonMembershipTypes,
       });
@@ -287,21 +512,16 @@ app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (re
         event_type: event.type,
         stripe_event_id: event.id,
         checkout_session_id: session.id,
-        checkout_created_unix: session.created,
         checkout_created_iso: toIso(session.created),
         customer: {
-          id: customerId,
           email,
           name: customer.name,
-          metadata: customer.metadata,
         },
         checkout_payment: {
           amount_total: session.amount_total,
           currency: session.currency || null,
-          payment_intent: session.payment_intent || null,
         },
         eventsair_lookup: {
-          email,
           found: Boolean(selectedEventsAirMatch),
           event_id: eventsAirLookup && eventsAirLookup.event_id ? eventsAirLookup.event_id : null,
           event_name: eventsAirLookup && eventsAirLookup.event_name ? eventsAirLookup.event_name : null,
@@ -311,39 +531,8 @@ app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (re
           selected_match: summarizeEventsAirMatch(selectedEventsAirMatch),
           errors: eventsAirLookup && eventsAirLookup.errors ? eventsAirLookup.errors : null,
         },
-        customer_metadata_preview: {
-          source: 'eventsair',
-        },
-        subscription_metadata_preview: {
-          source: 'eventsair',
-          primary_membership_type: primaryMembershipType || '',
-          addon_membership_types: addonMembershipTypes,
-        },
-        default_payment_method: summarizePaymentMethod(defaultPaymentMethod),
-        has_existing_subscription: hasExisting,
-        existing_subscriptions_count: existingSubscriptions.data.length,
-        existing_subscriptions: existingSubscriptions.data.map(summarizeSubscription),
-        pending_invoice_items_count: pendingInvoiceItems.data.length,
-        pending_invoice_items: pendingInvoiceItems.data.map(summarizeInvoiceItem),
-        draft_invoices_count: draftInvoices.data.length,
-        draft_invoices: draftInvoices.data.map(summarizeInvoice),
-        open_invoices_count: openInvoices.data.length,
-        open_invoices: openInvoices.data.map(summarizeInvoice),
-        planned_trial_end_unix: trialEnd,
-        planned_trial_end_iso: toIso(trialEnd),
-        flow_type: isFreeUserFlow ? 'free-user-refund' : 'paid-membership',
-        free_user_evaluation: {
-          eligible_for_auto_refund: isFreeUserFlow,
-          requires_primary_membership_type: Boolean(primaryMembershipType),
-          requires_no_addons: addonMembershipTypes.length === 0,
-          requires_point_five_euro_checkout: session.amount_total === freeMembershipCaptureAmountCents
-            && String(session.currency || '').toLowerCase() === freeMembershipCaptureCurrency,
-        },
-        mapped_subscription_items: subscriptionItemPreview.items,
+        mapped_subscription_items: subscriptionItemPreview.items.map(summarizeMappedSubscriptionItem),
         missing_price_mappings: subscriptionItemPreview.missing_price_mappings,
-        default_tax_rate_id: defaultTaxRateId,
-        create_subscriptions_enabled: createSubscriptions,
-        subscription_create_params: subscriptionCreateParams,
       };
 
       let refundResult = null;
@@ -378,55 +567,63 @@ app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (re
 
       if (!selectedEventsAirMatch) {
         debugResult.note = 'No EventsAIR match found for this email. Subscription was not created.';
-        console.log(JSON.stringify(debugResult, null, 2));
+        await logWebhookJson(debugResult);
+        await completeWebhookEventProcessing(event.id);
         return res.json({ received: true, skipped: 'no-eventsair-match' });
       }
 
       if (!primaryMembershipType) {
         debugResult.note = 'No primary membership type found in EventsAIR registrations. Subscription was not created.';
-        console.log(JSON.stringify(debugResult, null, 2));
+        await logWebhookJson(debugResult);
+        await completeWebhookEventProcessing(event.id);
         return res.json({ received: true, skipped: 'missing-primary-membership-type' });
       }
 
       if (isFreeUserFlow) {
-        // Refund the temporary card-capture charge before continuing with
-        // subscription creation so free users are never left with a retained 0.50 EUR payment.
+        // Refund the temporary card-capture charge first so free users are not left
+        // with a retained checkout payment if the rest of the flow succeeds.
         await refundFreeUserCapture();
       }
 
       if (subscriptionItemPreview.missing_price_mappings.length > 0) {
         debugResult.note = 'One or more registration types do not have Stripe price mappings. Subscription was not created.';
-        console.log(JSON.stringify(debugResult, null, 2));
+        await logWebhookJson(debugResult);
+        await completeWebhookEventProcessing(event.id);
         return res.json({ received: true, skipped: 'missing-price-mapping' });
       }
 
       if (!defaultPaymentMethod || !defaultPaymentMethod.id) {
         debugResult.note = 'No saved payment method found. Subscription was not created.';
-        console.log(JSON.stringify(debugResult, null, 2));
+        await logWebhookJson(debugResult);
+        await completeWebhookEventProcessing(event.id);
         return res.json({ received: true, skipped: 'no-payment-method' });
       }
 
       if (hasExisting) {
         debugResult.note = 'Existing subscription found. No new subscription was created.';
-        console.log(JSON.stringify(debugResult, null, 2));
+        await logWebhookJson(debugResult);
+        await completeWebhookEventProcessing(event.id);
         return res.json({ received: true, skipped: 'existing-subscription' });
       }
 
       if (hasOpenInvoiceNeedingPayment) {
         debugResult.note = 'Open invoice requiring payment found. Subscription was not created to avoid an unexpected second charge.';
-        console.log(JSON.stringify(debugResult, null, 2));
+        await logWebhookJson(debugResult);
+        await completeWebhookEventProcessing(event.id);
         return res.json({ received: true, skipped: 'open-invoice-needing-payment' });
       }
 
       if (!defaultTaxRateId) {
         debugResult.note = 'STRIPE_DEFAULT_TAX_RATE_ID is not configured. Subscription was not created because 21% VAT is required.';
-        console.log(JSON.stringify(debugResult, null, 2));
+        await logWebhookJson(debugResult);
+        await completeWebhookEventProcessing(event.id);
         return res.json({ received: true, skipped: 'missing-tax-rate' });
       }
 
       if (!createSubscriptions) {
         debugResult.note = 'Preview mode only. No subscription created. Set CREATE_SUBSCRIPTIONS=true to enable creation.';
-        console.log(JSON.stringify(debugResult, null, 2));
+        await logWebhookJson(debugResult);
+        await completeWebhookEventProcessing(event.id);
         return res.json({ received: true, preview: true });
       }
 
@@ -437,21 +634,21 @@ app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (re
         metadata: {
           ...customer.metadata,
           source: 'eventsair',
+          member_id: eventsAirMemberId != null ? String(eventsAirMemberId) : '',
         },
       });
 
-      const cleanupResult = await cleanupCheckoutBillingArtifacts({
+      // Clear draft invoices and pending invoice items created by the initial checkout.
+      // Otherwise Stripe can try to carry them onto the first subscription invoice.
+      await cleanupCheckoutBillingArtifacts({
         customerId,
         session,
         pendingInvoiceItems: pendingInvoiceItems.data,
         draftInvoices: draftInvoices.data,
       });
 
-      debugResult.cleanup_result = cleanupResult;
-
-      // Both paid users and free users receive the same future renewal subscription.
-      // Paid users keep the checkout payment, while free users have already had their
-      // temporary 0.50 EUR card-capture charge refunded before subscription creation.
+      // Both paid users and free users end up with the same yearly renewal subscription.
+      // The only difference is that free users already had the temporary checkout charge refunded.
       const createdSubscription = await stripe.subscriptions.create(
         subscriptionCreateParams,
         {
@@ -464,12 +661,23 @@ app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (re
         : 'Subscription created successfully.';
       debugResult.created_subscription = summarizeSubscription(createdSubscription);
       debugResult.refund_result = summarizeRefund(refundResult);
-      console.log(JSON.stringify(debugResult, null, 2));
+      await logWebhookJson(debugResult);
+      await completeWebhookEventProcessing(event.id);
     }
 
+    await completeWebhookEventProcessing(event.id);
     return res.json({ received: true });
   } catch (error) {
-    console.error('Webhook handling failed:', error);
+    if (event && event.id) {
+      await releaseWebhookEventProcessing(event.id, error.message);
+    }
+    await logWebhookError({
+      type: 'webhook-handler-error',
+      event_type: event ? event.type : null,
+      stripe_event_id: event ? event.id : null,
+      message: `Webhook handling failed: ${error.message}`,
+      stack: error.stack || null,
+    });
     return res.status(500).json({ error: error.message });
   }
 });
@@ -479,6 +687,16 @@ app.get('/health', (_req, res) => {
 });
 
 app.listen(port, () => {
-  console.log(`Webhook server listening on http://localhost:${port}`);
-  console.log(`CREATE_SUBSCRIPTIONS=${createSubscriptions}`);
+  if (enableConsoleLogs) {
+    console.log(`Webhook server listening on http://localhost:${port}`);
+    console.log(`CREATE_SUBSCRIPTIONS=${createSubscriptions}`);
+  }
+  void appendWebhookLog({
+    type: 'webhook-server-start',
+    message: `Webhook server listening on http://localhost:${port}`,
+    create_subscriptions: createSubscriptions,
+    webhook_console_logs: enableConsoleLogs,
+    webhook_log_path: webhookLogPath,
+    webhook_event_state_path: webhookEventStatePath,
+  });
 });
