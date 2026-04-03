@@ -4,7 +4,6 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "check:eventsair": "node scripts/check-eventsair.js",
     "check:customer": "node scripts/check-customer.js",
     "webhook": "node src/webhook.js"
   },
