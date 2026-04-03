@@ -1,4 +1,6 @@
 import 'dotenv/config';
+import { stripeCatalogConfig as testStripeCatalogConfig } from './config/registration-type-map.test.js';
+import { stripeCatalogConfig as liveStripeCatalogConfig } from './config/registration-type-map.live.js';
 
 // This file defines the business mapping between EventsAir registration type names
 // and the Stripe catalog objects used for recurring subscriptions.
@@ -10,40 +12,13 @@ function normalizeTypeName(value) {
   return typeof value === 'string' ? value.trim().toLowerCase() : '';
 }
 
-export const stripeCatalogConfig = {
-  mode: 'test',
-  primaryMembershipTypes: [
-    'Active Member',
-    'Associate Member',
-  ],
+function resolveStripeMode() {
+  // Stripe test/live catalog selection is environment-driven so deployments do not
+  // need to swap mapping files manually. Any unknown value safely falls back to test.
+  return process.env.STRIPE_MODE === 'live' ? 'live' : 'test';
+}
 
-  aliases: {
-    'Associate Membership': 'Associate Member',
-  },
-
-  priceMap: {
-    'Active Member': {
-      role: 'primary',
-      priceId: 'price_1TF8EzCsrIQtLPXlG3RH6E8k',
-    },
-    'Associate Member': {
-      role: 'primary',
-      priceId: 'price_1TF8FgCsrIQtLPXlddQ94zg0',
-    },
-    Test: {
-      role: 'addon',
-      priceId: 'price_1TGv6jCsrIQtLPXldSwPU1id',
-    },
-    'National Fund - France': {
-      role: 'addon',
-      priceId: 'price_1TGv9UCsrIQtLPXlYy03I0rQ',
-    },
-    'SICOT CONECT - Digital Orthopaedics & AI': {
-      role: 'addon',
-      priceId: 'price_1TGvAFCsrIQtLPXl6xGVjMA3',
-    },
-  },
-};
+export const stripeCatalogConfig = resolveStripeMode() === 'live' ? liveStripeCatalogConfig : testStripeCatalogConfig;
 
 export function resolveRegistrationTypeAlias(regTypeName) {
   // Some historical EventsAir names differ slightly from the Stripe catalog naming.
