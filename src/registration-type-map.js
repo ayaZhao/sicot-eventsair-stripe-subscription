@@ -1,5 +1,11 @@
 import 'dotenv/config';
 
+// This file defines the business mapping between EventsAir registration type names
+// and the Stripe catalog objects used for recurring subscriptions.
+// The webhook relies on it for three decisions:
+// 1. which registration types count as primary yearly memberships
+// 2. whether an EventsAir type name should be normalized through an alias
+// 3. which Stripe price id to use for each primary membership or addon
 function normalizeTypeName(value) {
   return typeof value === 'string' ? value.trim().toLowerCase() : '';
 }
@@ -40,6 +46,8 @@ export const stripeCatalogConfig = {
 };
 
 export function resolveRegistrationTypeAlias(regTypeName) {
+  // Some historical EventsAir names differ slightly from the Stripe catalog naming.
+  // This keeps the webhook mapping resilient without changing stored registration data.
   if (!regTypeName) {
     return null;
   }
@@ -58,6 +66,8 @@ export function resolveRegistrationTypeAlias(regTypeName) {
 }
 
 export function isPrimaryMembershipType(regTypeName) {
+  // Primary membership types drive the main yearly subscription item. Everything
+  // else returned from EventsAir registrations is treated as an addon.
   const resolvedName = resolveRegistrationTypeAlias(regTypeName);
   const normalizedResolvedName = normalizeTypeName(resolvedName);
 
@@ -67,6 +77,7 @@ export function isPrimaryMembershipType(regTypeName) {
 }
 
 export function getRegistrationTypeStripeConfig(regTypeName) {
+  // Resolve the final Stripe price configuration for one EventsAir registration type.
   const resolvedName = resolveRegistrationTypeAlias(regTypeName);
   if (!resolvedName) {
     return null;
@@ -85,6 +96,9 @@ export function getRegistrationTypeStripeConfig(regTypeName) {
 }
 
 export function buildSubscriptionItemsFromRegistrationTypes({ primaryMembershipType, addonMembershipTypes }) {
+  // Convert the EventsAir classification result into the Stripe subscription items
+  // that will be created by the webhook. Any missing mapping is returned separately
+  // so the webhook can stop safely instead of creating a partial subscription.
   const items = [];
   const missingPriceMappings = [];
 

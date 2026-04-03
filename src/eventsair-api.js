@@ -2,6 +2,12 @@ import 'dotenv/config';
 import fetch from 'node-fetch';
 import { isPrimaryMembershipType } from './registration-type-map.js';
 
+// This module is the single EventsAir integration layer used by the webhook.
+// It is responsible for:
+// 1. obtaining an OAuth access token
+// 2. issuing GraphQL requests to EventsAir
+// 3. looking up an attendee by email within the configured membership event
+// 4. classifying returned registrations into one primary membership type plus addons
 const defaultGraphqlUrl = 'https://api.eventsair.com/graphql';
 const defaultTokenScope = 'https://eventsairprod.onmicrosoft.com/85d8f626-4e3d-4357-89c6-327d4e6d3d93/.default';
 const eventContactLookupQuery = `
@@ -43,15 +49,14 @@ const eventsListQuery = `
   }
 `;
 
-function normalizeTypeName(typeName) {
-  return typeof typeName === 'string' ? typeName.trim().toLowerCase() : null;
-}
-
 function isPrimaryMembershipTypeName(typeName) {
   return Boolean(typeName) && isPrimaryMembershipType(typeName);
 }
 
 export function classifyRegistrations(registrations) {
+  // EventsAir can return multiple registrations for one attendee. The webhook treats
+  // the first registration that matches a configured primary membership type as the
+  // yearly membership, and everything else as addon registrations.
   const normalizedRegistrations = Array.isArray(registrations) ? registrations : [];
   const primaryRegistrationIndex = normalizedRegistrations.findIndex((registration) => {
     return isPrimaryMembershipTypeName(registration && registration.type ? registration.type.name : null);
@@ -86,25 +91,8 @@ function getRequiredEnv(name) {
   return value;
 }
 
-function getByPath(object, pathExpression) {
-  if (!object || !pathExpression) {
-    return null;
-  }
-
-  return pathExpression.split('.').reduce((current, part) => {
-    if (current == null) {
-      return null;
-    }
-
-    if (/^\d+$/.test(part)) {
-      return current[Number(part)] == null ? null : current[Number(part)];
-    }
-
-    return current[part] == null ? null : current[part];
-  }, object);
-}
-
 export async function getEventsAirAccessToken() {
+  // EventsAir GraphQL uses Azure AD client-credentials authentication.
   const tenantId = getRequiredEnv('EVENTSAIR_TENANT_ID');
   const clientId = getRequiredEnv('EVENTSAIR_CLIENT_ID');
   const clientSecret = getRequiredEnv('EVENTSAIR_CLIENT_SECRET');
@@ -137,6 +125,8 @@ export async function getEventsAirAccessToken() {
 }
 
 export async function runEventsAirGraphqlQuery({ query, variables }) {
+  // Centralized GraphQL execution keeps the webhook and helper scripts using the
+  // same auth flow, endpoint, and error handling.
   const accessToken = await getEventsAirAccessToken();
   const graphqlUrl = process.env.EVENTSAIR_GRAPHQL_URL || defaultGraphqlUrl;
 
@@ -158,52 +148,9 @@ export async function runEventsAirGraphqlQuery({ query, variables }) {
   return response.json();
 }
 
-export async function fetchEventsAirMetadataByEmail(email) {
-  if (!email) {
-    throw new Error('Email is required for EventsAIR lookup');
-  }
-
-  const query = process.env.EVENTSAIR_CONTACT_LOOKUP_QUERY;
-  if (!query) {
-    return {
-      enabled: false,
-      reason: 'EVENTSAIR_CONTACT_LOOKUP_QUERY is not configured',
-    };
-  }
-
-  const responsePath = process.env.EVENTSAIR_CONTACT_LOOKUP_RESPONSE_PATH;
-  const memberIdPath = process.env.EVENTSAIR_CONTACT_LOOKUP_MEMBER_ID_PATH || 'id';
-  const membershipTypePath = process.env.EVENTSAIR_CONTACT_LOOKUP_MEMBERSHIP_TYPE_PATH || 'registrationType.name';
-
-  const payload = await runEventsAirGraphqlQuery({
-    query,
-    variables: { email },
-  });
-
-  if (payload.errors && payload.errors.length > 0) {
-    return {
-      enabled: true,
-      found: false,
-      errors: payload.errors,
-      raw_payload: payload,
-    };
-  }
-
-  const record = responsePath ? getByPath(payload, responsePath) : payload.data;
-  const normalizedRecord = Array.isArray(record) ? record[0] || null : record;
-
-  return {
-    enabled: true,
-    found: Boolean(normalizedRecord),
-    response_path: responsePath || null,
-    member_id: getByPath(normalizedRecord, memberIdPath),
-    membership_type: getByPath(normalizedRecord, membershipTypePath),
-    record: normalizedRecord,
-    raw_payload: payload,
-  };
-}
-
 export async function lookupMembershipContactsByEmail(email) {
+  // Main webhook lookup: query the configured membership event by email and return
+  // normalized matches with primary/addon registration classification attached.
   if (!email) {
     throw new Error('Email is required for EventsAIR membership contact lookup');
   }
