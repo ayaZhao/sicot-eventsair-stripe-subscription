@@ -90,6 +90,38 @@ Use the endpoint-specific `whsec_...` secret from Stripe test mode in:
 STRIPE_WEBHOOK_SECRET
 ```
 
+## Docker Deployment
+
+The project can also run as a Docker container, which is a good fit for test and
+live servers because the same image can be promoted between environments.
+
+Build and start the webhook with Docker Compose:
+
+```bash
+docker compose up -d --build
+```
+
+Check the running container:
+
+```bash
+docker compose ps
+docker compose logs -f
+```
+
+Stop the container:
+
+```bash
+docker compose down
+```
+
+The container reads environment variables from `.env`, exposes the webhook on
+internal port `3000`, and persists JSON logs plus Stripe event dedupe state in:
+
+```text
+./logs
+./.runtime
+```
+
 ## Deployment Notes
 
 For live mode, deploy this service to a stable public HTTPS URL such as:
