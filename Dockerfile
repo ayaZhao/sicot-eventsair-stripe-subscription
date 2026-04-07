@@ -10,10 +10,7 @@ COPY scripts ./scripts
 COPY readme.md ./
 COPY .env.example ./
 
-RUN mkdir -p /app/logs /app/.runtime \
-  && chown -R node:node /app
-
-USER node
+RUN mkdir -p /app/logs /app/.runtime
 
 ENV PORT=3000
 EXPOSE 3000
