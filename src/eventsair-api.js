@@ -18,22 +18,14 @@ const eventContactLookupQuery = `
       contacts(input: { contactFilter: { primaryEmail: $email, includeInactive: true } }, offset: 0, limit: 20) {
         id
         internalNumber
-        firstName
-        lastName
-        primaryEmail
         externalIdentifier
         registrations {
           id
           type {
-            id
             name
           }
-        }
-        functionRegistrations {
-          id
-          feeType {
-            id
-            name
+          paymentDetails {
+            paymentStatus
           }
         }
       }
@@ -53,20 +45,35 @@ function isPrimaryMembershipTypeName(typeName) {
   return Boolean(typeName) && isPrimaryMembershipType(typeName);
 }
 
+export function getRegistrationPaymentStatus(registration) {
+  return registration
+    && registration.paymentDetails
+    && typeof registration.paymentDetails.paymentStatus === 'string'
+    ? registration.paymentDetails.paymentStatus
+    : null;
+}
+
+export function isCanceledRegistration(registration) {
+  const paymentStatus = getRegistrationPaymentStatus(registration);
+  return typeof paymentStatus === 'string' && paymentStatus.startsWith('CANCELED');
+}
+
 export function classifyRegistrations(registrations) {
   // EventsAir can return multiple registrations for one attendee. The webhook treats
   // the first registration that matches a configured primary membership type as the
   // yearly membership, and everything else as addon registrations.
+  // Registrations with a canceled payment status are ignored for subscription logic.
   const normalizedRegistrations = Array.isArray(registrations) ? registrations : [];
-  const primaryRegistrationIndex = normalizedRegistrations.findIndex((registration) => {
+  const activeRegistrations = normalizedRegistrations.filter((registration) => !isCanceledRegistration(registration));
+  const primaryRegistrationIndex = activeRegistrations.findIndex((registration) => {
     return isPrimaryMembershipTypeName(registration && registration.type ? registration.type.name : null);
   });
 
   const primaryRegistration = primaryRegistrationIndex >= 0
-    ? normalizedRegistrations[primaryRegistrationIndex]
+    ? activeRegistrations[primaryRegistrationIndex]
     : null;
 
-  const addonRegistrations = normalizedRegistrations.filter((registration, index) => {
+  const addonRegistrations = activeRegistrations.filter((registration, index) => {
     return index !== primaryRegistrationIndex;
   });
 

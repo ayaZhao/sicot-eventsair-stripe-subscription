@@ -3,7 +3,7 @@ import express from 'express';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import Stripe from 'stripe';
-import { lookupMembershipContactsByEmail } from './eventsair-api.js';
+import { isCanceledRegistration, lookupMembershipContactsByEmail } from './eventsair-api.js';
 import { buildSubscriptionItemsFromRegistrationTypes } from './registration-type-map.js';
 
 const app = express();
@@ -254,7 +254,7 @@ function hasRegistrationsReady(eventsAirLookup) {
     ? selectedMatch.contact.registrations
     : [];
 
-  return registrations.length > 0;
+  return registrations.some((registration) => !isCanceledRegistration(registration));
 }
 
 async function lookupMembershipContactsByEmailWithRetry(email) {
@@ -433,6 +433,7 @@ app.post('/api/eventsair/v1/stripe/webhook', express.raw({ type: 'application/js
         : null;
       const primaryMembershipType = selectedEventsAirMatch ? selectedEventsAirMatch.primary_membership_type : null;
       const addonMembershipTypes = selectedEventsAirMatch ? selectedEventsAirMatch.addon_membership_types || [] : [];
+      const hasNoFilteredRegistrationTypes = !primaryMembershipType && addonMembershipTypes.length === 0;
 
       // Registration types from EventsAir drive both the Stripe price mapping and the
       // decision about whether this checkout is a paid renewal or a free member capture.
@@ -570,6 +571,13 @@ app.post('/api/eventsair/v1/stripe/webhook', express.raw({ type: 'application/js
         await logWebhookJson(debugResult);
         await completeWebhookEventProcessing(event.id);
         return res.json({ received: true, skipped: 'no-eventsair-match' });
+      }
+
+      if (hasNoFilteredRegistrationTypes) {
+        debugResult.note = 'No active EventsAIR registration types remained after filtering. Subscription was not created.';
+        await logWebhookJson(debugResult);
+        await completeWebhookEventProcessing(event.id);
+        return res.json({ received: true, skipped: 'no-active-registration-types' });
       }
 
       if (!primaryMembershipType) {
