@@ -16,7 +16,13 @@ export const stripeCatalogConfig = {
   aliases: {
     'Associate Membership': 'Associate Member',
     'Active Member Free': 'Active Member',
+    'Active Member (Complimentary)': 'Active Member',
+    'Active Member - Discounted (Complimentary)': 'Active Member - Discounted',
+    'Active Member - EU (Complimentary)': 'Active Member - EU',
     'Associate Member Free': 'Associate Member',
+    'Associate Member (Complimentary)': 'Associate Member',
+    'Associate Member - Discounted (Complimentary)': 'Associate Member - Discounted',
+    'Associate Member - EU (Complimentary)': 'Associate Member - EU',
   },
 
   priceMap: {
