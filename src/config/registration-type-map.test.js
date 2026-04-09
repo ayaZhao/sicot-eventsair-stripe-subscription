@@ -62,5 +62,13 @@ export const stripeCatalogConfig = {
       role: 'addon',
       priceId: 'price_1TGvAFCsrIQtLPXl6xGVjMA3',
     },
+    'SICOT CONECT - Spine': {
+      role: 'addon',
+      priceId: 'price_1TKFvFCsrIQtLPXlk6MrpJyl',
+    },
+    'SICOT CONECT - Spine - Discounted': {
+      role: 'addon',
+      priceId: 'price_1TKFvZCsrIQtLPXljGvOtDsv',
+    }
   },
 };
