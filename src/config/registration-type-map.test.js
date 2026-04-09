@@ -30,9 +30,25 @@ export const stripeCatalogConfig = {
       role: 'primary',
       priceId: 'price_1TF8EzCsrIQtLPXlG3RH6E8k',
     },
+    'Active Member - Discounted': {
+      role: 'primary',
+      priceId: 'price_1TKFNkCsrIQtLPXlfyDuPeFQ',
+    },
+    'Active Member - EU': {
+      role: 'primary',
+      priceId: 'price_1TKFOZCsrIQtLPXlriBnny0E',
+    },
     'Associate Member': {
       role: 'primary',
       priceId: 'price_1TF8FgCsrIQtLPXlddQ94zg0',
+    },
+    'Associate Member - Discounted': {
+      role: 'primary',
+      priceId: 'price_1TKFPJCsrIQtLPXlxb70biqB',
+    },
+    'Associate Member - EU': {
+      role: 'primary',
+      priceId: 'price_1TKFPxCsrIQtLPXlTjaNhGsm',
     },
     Test: {
       role: 'addon',
