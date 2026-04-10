@@ -42,6 +42,12 @@ function toIso(unixSeconds) {
   return unixSeconds ? new Date(unixSeconds * 1000).toISOString() : null;
 }
 
+function getNextRenewalJanuarySeventhUnix(referenceUnixSeconds) {
+  const referenceDate = new Date(referenceUnixSeconds * 1000);
+  const nextYear = referenceDate.getUTCFullYear() + 1;
+  return Math.floor(Date.UTC(nextYear, 0, 7, 0, 0, 0) / 1000);
+}
+
 async function loadWebhookEventState() {
   try {
     const file = await fs.readFile(webhookEventStatePath, 'utf8');
@@ -481,7 +487,9 @@ app.post('/api/eventsair/v1/stripe/webhook', express.raw({ type: 'application/js
         (invoice) => (invoice.amount_remaining || 0) > 0,
       );
 
-      const trialEnd = session.created + 365 * 24 * 60 * 60;
+      // Previous logic kept each subscription on a rolling 365-day cycle.
+      // const trialEnd = session.created + 365 * 24 * 60 * 60;
+      const trialEnd = getNextRenewalJanuarySeventhUnix(session.created);
       const defaultPaymentMethod = paymentMethods.data[0] || null;
 
       // Free members are modeled as a 0.50 EUR checkout with a primary membership type
