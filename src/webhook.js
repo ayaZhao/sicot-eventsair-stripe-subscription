@@ -45,7 +45,9 @@ function toIso(unixSeconds) {
 function getNextRenewalJanuarySeventhUnix(referenceUnixSeconds) {
   const referenceDate = new Date(referenceUnixSeconds * 1000);
   const nextYear = referenceDate.getUTCFullYear() + 1;
-  return Math.floor(Date.UTC(nextYear, 0, 7, 0, 0, 0) / 1000);
+  // SICOT asked for renewals to start at 12:00 noon Belgium time on 7 January.
+  // Belgium is on CET (UTC+1) on 7 January, so we anchor the Stripe trial end at 11:00 UTC.
+  return Math.floor(Date.UTC(nextYear, 0, 7, 11, 0, 0) / 1000);
 }
 
 async function loadWebhookEventState() {
@@ -488,6 +490,8 @@ app.post('/api/eventsair/v1/stripe/webhook', express.raw({ type: 'application/js
       );
 
       // Previous logic kept each subscription on a rolling 365-day cycle.
+      // Renewals are now aligned to 7 January of the following calendar year at
+      // 12:00 noon Belgium time for the EventsAir migration.
       // const trialEnd = session.created + 365 * 24 * 60 * 60;
       const trialEnd = getNextRenewalJanuarySeventhUnix(session.created);
       const defaultPaymentMethod = paymentMethods.data[0] || null;

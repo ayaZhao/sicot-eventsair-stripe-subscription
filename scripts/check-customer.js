@@ -37,6 +37,14 @@ function toIso(unixSeconds) {
   return unixSeconds ? new Date(unixSeconds * 1000).toISOString() : null;
 }
 
+function getNextRenewalJanuarySeventhUnix(referenceUnixSeconds) {
+  const referenceDate = new Date(referenceUnixSeconds * 1000);
+  const nextYear = referenceDate.getUTCFullYear() + 1;
+  // SICOT asked for renewals to start at 12:00 noon Belgium time on 7 January.
+  // Belgium is on CET (UTC+1) on 7 January, so we anchor the Stripe trial end at 11:00 UTC.
+  return Math.floor(Date.UTC(nextYear, 0, 7, 11, 0, 0) / 1000);
+}
+
 function summarizePaymentMethod(paymentMethod) {
   if (!paymentMethod) {
     return null;
@@ -234,7 +242,10 @@ async function main() {
   const referenceTimestamp = latestCharge ? latestCharge.created : Math.floor(Date.now() / 1000);
   const referenceAmount = latestCharge ? latestCharge.amount : null;
 
-  const plannedTrialEndUnix = referenceTimestamp + 365 * 24 * 60 * 60;
+  // Previous logic kept each subscription on a rolling 365-day cycle.
+  // Renewals are now aligned to 7 January of the following calendar year at
+  // 12:00 noon Belgium time for the EventsAir migration.
+  const plannedTrialEndUnix = getNextRenewalJanuarySeventhUnix(referenceTimestamp);
 
   const cleanupPreview = {
     pending_invoice_item_ids_to_delete: pendingInvoiceItems.data
