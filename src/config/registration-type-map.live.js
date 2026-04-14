@@ -68,22 +68,6 @@ export const stripeCatalogConfig = {
       role: 'primary',
       priceId: 'price_1TI0yACsrIQtLPXlbMdlp010',
     },
-    'National Fund - France': {
-      role: 'addon',
-      priceId: 'price_1TI0z3CsrIQtLPXlOLdUR4f2',
-    },
-    'National Fund - Japan': {
-      role: 'addon',
-      priceId: 'price_1TI0zYCsrIQtLPXl12FM8jTg',
-    },
-    'National Fund - United Kingdom': {
-      role: 'addon',
-      priceId: 'price_1TI10VCsrIQtLPXluzgS9U4z',
-    },
-    'National Fund - United States': {
-      role: 'addon',
-      priceId: 'price_1TI12dCsrIQtLPXlYKFz3V31',
-    },
     'SICOT CONECT - Digital Orthopaedics & AI': {
       role: 'addon',
       priceId: 'price_1TI13LCsrIQtLPXlecz06bHa',
